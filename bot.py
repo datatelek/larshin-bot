@@ -148,22 +148,27 @@ router = Router()
 # ── /start ─────────────────────────────────────────────────────────────────────
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
-    # Если Анна пишет /start — сохраняем её chat_id и сообщаем
-    if message.from_user and message.from_user.username and \
-       message.from_user.username.lower() == "larshinaann":
+    user = message.from_user
+    # Логируем chat_id каждого кто пишет /start — для отладки
+    logger.info(f"/start from: chat_id={message.chat.id} username=@{user.username if user else '?'} name={user.first_name if user else '?'}")
+
+    # Если Анна пишет /start — сообщаем ей chat_id (проверяем по username И по ANNA_CHAT_ID)
+    is_anna = (
+        user and user.username and user.username.lower() in ("larshinaann", "larshinaanna")
+    ) or (
+        ANNA_CHAT_ID and str(message.chat.id) == str(ANNA_CHAT_ID)
+    )
+
+    if is_anna:
         await state.clear()
         await message.answer(
-            "Анна, ваш chat_id сохранён ✅\n"
-            f"chat_id = `{message.chat.id}`\n\n"
-            "Теперь бот будет автоматически присылать вам результаты тестов.",
+            f"Анна, ваш chat\_id: `{message.chat.id}`\n\n"
+            "Бот будет автоматически присылать вам результаты тестов.",
             parse_mode="Markdown"
         )
-        # Запишем в файл (для Railway — через env переменную лучше, но так тоже работает)
-        with open("anna_chat_id.txt", "w") as f:
-            f.write(str(message.chat.id))
         return
 
-    user_name = message.from_user.first_name if message.from_user else "друг"
+    user_name = user.first_name if user else "друг"
     await state.clear()
     await state.update_data(user_name=user_name, user_id=message.from_user.id if message.from_user else None)
 
