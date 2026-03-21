@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ─── Конфигурация ──────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ANNA_CHAT_ID = os.environ.get("ANNA_CHAT_ID", "")   # chat_id Анны (числовой)
-CHANNEL_USERNAME = "@larshinaann_channel"            # канал для проверки подписки (можно изменить)
+CHANNEL_USERNAME = "@larshina_ann"                   # канал для проверки подписки
 
 # ─── Состояния FSM ─────────────────────────────────────────────────────────────
 class Survey(StatesGroup):
@@ -198,12 +198,28 @@ async def cb_start_survey(call: CallbackQuery, state: FSMContext):
     )
     await state.set_state(Survey.waiting_subscription)
 
-# ── Подтверждение подписки → запрос телефона ──────────────────────────────────
+# ── Подтверждение подписки → проверка → запрос телефона ──────────────────────
 @router.callback_query(F.data == "subscribed", Survey.waiting_subscription)
-async def cb_subscribed(call: CallbackQuery, state: FSMContext):
+async def cb_subscribed(call: CallbackQuery, state: FSMContext, bot: Bot):
+    user_id = call.from_user.id
+    # Реальная проверка подписки через Telegram API
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        is_member = member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        logger.warning(f"Subscription check failed for {user_id}: {e}")
+        is_member = False
+
+    if not is_member:
+        await call.answer(
+            "Вы ещё не подписаны на канал 🙁\n\nПодпишитесь и нажмите кнопку ещё раз.",
+            show_alert=True
+        )
+        return
+
     await call.message.edit_reply_markup(reply_markup=None)
     await call.message.answer(
-        "Отлично! 🎉\n\n"
+        "Подписка подтверждена ✅\n\n"
         "Для связи с вами оставьте, пожалуйста, номер телефона:",
         reply_markup=phone_keyboard()
     )
