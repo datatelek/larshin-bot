@@ -3,3 +3,8 @@ __pycache__/
 .env
 anna_chat_id.txt
 *.log
+data/
+outputs/
+.pytest_cache/
+.ruff_cache/
+.test-temp/
