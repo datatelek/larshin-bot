@@ -21,7 +21,7 @@ def build_application(config: AppConfig) -> Application:
         await application.bot.set_my_commands(
             [
                 BotCommand("menu", "Открыть меню"),
-                BotCommand("limit", "Показать лимит изображений"),
+                BotCommand("limit", "Показать лимиты и расходы"),
                 BotCommand("whoami", "Показать Telegram ID"),
                 BotCommand("stats", "Статистика администратора"),
             ]

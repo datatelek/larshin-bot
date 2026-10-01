@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -17,6 +18,17 @@ def _parse_ids(raw_value: str) -> frozenset[int]:
     return frozenset(values)
 
 
+def _parse_usd_micros(variable_name: str, default: str) -> int:
+    raw_value = os.getenv(variable_name, default).strip()
+    try:
+        value = Decimal(raw_value)
+    except InvalidOperation as exc:
+        raise ValueError(f"{variable_name} должен быть числом") from exc
+    if value <= 0:
+        raise ValueError(f"{variable_name} должен быть больше нуля")
+    return int(value * 1_000_000)
+
+
 @dataclass(frozen=True, slots=True)
 class AppConfig:
     telegram_bot_token: str
@@ -27,6 +39,8 @@ class AppConfig:
     image_model: str
     image_quality: str
     daily_image_limit: int
+    daily_user_budget_microusd: int
+    weekly_global_budget_microusd: int
     timezone: ZoneInfo
     database_path: Path
     log_level: str
@@ -68,6 +82,12 @@ class AppConfig:
             image_model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare").strip(),
             image_quality=image_quality,
             daily_image_limit=daily_limit,
+            daily_user_budget_microusd=_parse_usd_micros(
+                "DAILY_USER_BUDGET_USD", "0.50"
+            ),
+            weekly_global_budget_microusd=_parse_usd_micros(
+                "WEEKLY_GLOBAL_BUDGET_USD", "4.50"
+            ),
             timezone=timezone,
             database_path=Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
