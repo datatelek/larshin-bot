@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -16,7 +16,11 @@ from telegram.ext import (
 
 from app.config import AppConfig
 from app.database import Database
-from app.openai_service import OpenAIService
+from app.openai_service import (
+    IMAGE_RESERVATION_MICROUSD,
+    TEXT_RESERVATION_MICROUSD,
+    OpenAIService,
+)
 from app.utils import split_telegram_text
 
 LOGGER = logging.getLogger(__name__)
@@ -104,6 +108,35 @@ class BotHandlers:
     def _today(self) -> str:
         return datetime.now(self.config.timezone).date().isoformat()
 
+    def _budget_periods(self) -> tuple[str, str, str]:
+        now = datetime.now(UTC)
+        local_date = now.astimezone(self.config.timezone).date().isoformat()
+        weekly_cutoff = (now - timedelta(days=7)).isoformat()
+        return local_date, weekly_cutoff, now.isoformat()
+
+    @staticmethod
+    def _format_usd(cost_microusd: int) -> str:
+        return f"${cost_microusd / 1_000_000:.2f}".replace(".", ",")
+
+    async def _check_budget(self, user_id: int, reservation_microusd: int):
+        usage_date, weekly_cutoff, _ = self._budget_periods()
+        usage = await self.database.get_budget_usage(user_id, usage_date, weekly_cutoff)
+        daily_allowed = (
+            usage.user_daily_microusd + reservation_microusd
+            <= self.config.daily_user_budget_microusd
+        )
+        weekly_allowed = (
+            usage.global_weekly_microusd + reservation_microusd
+            <= self.config.weekly_global_budget_microusd
+        )
+        return daily_allowed, weekly_allowed, usage
+
+    async def _record_cost(self, user_id: int, category: str, cost_microusd: int) -> None:
+        usage_date, _, created_at = self._budget_periods()
+        await self.database.record_cost(
+            user_id, usage_date, created_at, cost_microusd, category
+        )
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_id = await self._require_access(update)
         if user_id is None:
@@ -126,11 +159,26 @@ class BotHandlers:
         await self._send_limit(update.effective_message, user_id)
 
     async def _send_limit(self, message, user_id: int) -> None:
-        used = await self.database.get_image_usage(user_id, self._today())
-        remaining = max(self.config.daily_image_limit - used, 0)
+        usage_date, weekly_cutoff, _ = self._budget_periods()
+        images_used = await self.database.get_image_usage(user_id, usage_date)
+        usage = await self.database.get_budget_usage(user_id, usage_date, weekly_cutoff)
+        images_remaining = max(self.config.daily_image_limit - images_used, 0)
+        daily_remaining = max(
+            self.config.daily_user_budget_microusd - usage.user_daily_microusd, 0
+        )
+        weekly_remaining = max(
+            self.config.weekly_global_budget_microusd - usage.global_weekly_microusd, 0
+        )
         await message.reply_text(
-            f"Изображения сегодня: {used} из {self.config.daily_image_limit}. "
-            f"Осталось: {remaining}. Сброс в 00:00 по Москве."
+            f"Ваш расход сегодня: {self._format_usd(usage.user_daily_microusd)} из "
+            f"{self._format_usd(self.config.daily_user_budget_microusd)}. "
+            f"Осталось: {self._format_usd(daily_remaining)}.\n"
+            f"Общий расход за 7 дней: "
+            f"{self._format_usd(usage.global_weekly_microusd)} из "
+            f"{self._format_usd(self.config.weekly_global_budget_microusd)}. "
+            f"Осталось: {self._format_usd(weekly_remaining)}.\n"
+            f"Изображения сегодня: {images_used} из {self.config.daily_image_limit}. "
+            f"Осталось: {images_remaining}. Дневной лимит сбрасывается в 00:00 по Москве."
         )
 
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -144,10 +192,22 @@ class BotHandlers:
         if not rows:
             await update.effective_message.reply_text("Пользователей пока нет.")
             return
-        lines = [f"Использование изображений за {self._today()}:"]
+        _, weekly_cutoff, _ = self._budget_periods()
+        weekly_usage = await self.database.get_budget_usage(user_id, self._today(), weekly_cutoff)
+        lines = [
+            f"Использование за {self._today()}:",
+            (
+                f"Общий расход за 7 дней: "
+                f"{self._format_usd(weekly_usage.global_weekly_microusd)} из "
+                f"{self._format_usd(self.config.weekly_global_budget_microusd)}."
+            ),
+        ]
         for row in rows:
             name = f"@{row.username}" if row.username else (row.first_name or str(row.user_id))
-            lines.append(f"{name} ({row.user_id}): {row.image_count}")
+            lines.append(
+                f"{name} ({row.user_id}): {self._format_usd(row.cost_microusd)}, "
+                f"изображений: {row.image_count}"
+            )
         await update.effective_message.reply_text("\n".join(lines))
 
     async def callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -211,11 +271,28 @@ class BotHandlers:
             await self._handle_text(message, user_id, mode, prompt)
 
     async def _handle_text(self, message, user_id: int, mode: str, prompt: str) -> None:
+        daily_allowed, weekly_allowed, _ = await self._check_budget(
+            user_id, TEXT_RESERVATION_MICROUSD
+        )
+        if not daily_allowed:
+            await message.reply_text(
+                "Ваш дневной лимит расходов исчерпан. Новый лимит будет доступен "
+                "завтра в 00:00 по Москве."
+            )
+            return
+        if not weekly_allowed:
+            await message.reply_text(
+                "Общий лимит расходов за последние 7 дней исчерпан. "
+                "Доступ восстановится автоматически по мере выхода старых расходов "
+                "из семидневного периода."
+            )
+            return
         await message.chat.send_action(ChatAction.TYPING)
         try:
-            answer = await self.openai.generate_text(user_id, mode, prompt)
+            result = await self.openai.generate_text(user_id, mode, prompt)
+            await self._record_cost(user_id, "text", result.cost_microusd)
             await self.database.record_event(user_id, mode, "success", prompt)
-            for part in split_telegram_text(answer):
+            for part in split_telegram_text(result.value):
                 await message.reply_text(part)
         except Exception as exc:
             LOGGER.exception("Ошибка текстовой генерации для пользователя %s", user_id)
@@ -225,6 +302,22 @@ class BotHandlers:
             )
 
     async def _handle_image(self, message, user_id: int, prompt: str, size: str) -> None:
+        daily_allowed, weekly_allowed, _ = await self._check_budget(
+            user_id, IMAGE_RESERVATION_MICROUSD
+        )
+        if not daily_allowed:
+            await message.reply_text(
+                "Ваш дневной лимит расходов исчерпан. Новый лимит будет доступен "
+                "завтра в 00:00 по Москве."
+            )
+            return
+        if not weekly_allowed:
+            await message.reply_text(
+                "Общий лимит расходов за последние 7 дней исчерпан. "
+                "Доступ восстановится автоматически по мере выхода старых расходов "
+                "из семидневного периода."
+            )
+            return
         usage_date = self._today()
         reserved, used = await self.database.reserve_image(
             user_id, usage_date, self.config.daily_image_limit
@@ -237,8 +330,9 @@ class BotHandlers:
             return
         await message.chat.send_action(ChatAction.UPLOAD_PHOTO)
         try:
-            image_bytes = await self.openai.generate_image(prompt, size)
-            image_file = io.BytesIO(image_bytes)
+            result = await self.openai.generate_image(prompt, size)
+            await self._record_cost(user_id, "image", result.cost_microusd)
+            image_file = io.BytesIO(result.value)
             image_file.name = "generated.png"
             remaining = self.config.daily_image_limit - used
             await message.reply_photo(

@@ -12,6 +12,13 @@ class UserDailyUsage:
     username: str | None
     first_name: str | None
     image_count: int
+    cost_microusd: int
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetUsage:
+    user_daily_microusd: int
+    global_weekly_microusd: int
 
 
 class Database:
@@ -62,6 +69,22 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_audit_log_user_created
                     ON audit_log(telegram_user_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS api_cost_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_user_id INTEGER NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    cost_microusd INTEGER NOT NULL CHECK (cost_microusd >= 0),
+                    category TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_api_cost_user_date
+                    ON api_cost_usage(telegram_user_id, usage_date);
+
+                CREATE INDEX IF NOT EXISTS idx_api_cost_created
+                    ON api_cost_usage(created_at);
                 """
             )
 
@@ -171,6 +194,60 @@ class Database:
         async with self._lock:
             await asyncio.to_thread(operation)
 
+    async def record_cost(
+        self,
+        user_id: int,
+        usage_date: str,
+        created_at: str,
+        cost_microusd: int,
+        category: str,
+    ) -> None:
+        if cost_microusd < 0:
+            raise ValueError("Стоимость запроса не может быть отрицательной")
+
+        def operation() -> None:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO api_cost_usage
+                        (telegram_user_id, usage_date, cost_microusd, category, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (user_id, usage_date, cost_microusd, category, created_at),
+                )
+
+        async with self._lock:
+            await asyncio.to_thread(operation)
+
+    async def get_budget_usage(
+        self, user_id: int, usage_date: str, weekly_cutoff: str
+    ) -> BudgetUsage:
+        def operation() -> BudgetUsage:
+            with self._connect() as connection:
+                daily_row = connection.execute(
+                    """
+                    SELECT COALESCE(SUM(cost_microusd), 0) AS total
+                    FROM api_cost_usage
+                    WHERE telegram_user_id = ? AND usage_date = ?
+                    """,
+                    (user_id, usage_date),
+                ).fetchone()
+                weekly_row = connection.execute(
+                    """
+                    SELECT COALESCE(SUM(cost_microusd), 0) AS total
+                    FROM api_cost_usage
+                    WHERE created_at >= ?
+                    """,
+                    (weekly_cutoff,),
+                ).fetchone()
+                return BudgetUsage(
+                    user_daily_microusd=int(daily_row["total"]),
+                    global_weekly_microusd=int(weekly_row["total"]),
+                )
+
+        async with self._lock:
+            return await asyncio.to_thread(operation)
+
     async def daily_usage(self, usage_date: str) -> list[UserDailyUsage]:
         def operation() -> list[UserDailyUsage]:
             with self._connect() as connection:
@@ -180,14 +257,21 @@ class Database:
                         u.telegram_user_id,
                         u.username,
                         u.first_name,
-                        COALESCE(i.image_count, 0) AS image_count
+                        COALESCE(i.image_count, 0) AS image_count,
+                        COALESCE(c.cost_microusd, 0) AS cost_microusd
                     FROM users AS u
                     LEFT JOIN image_usage AS i
                         ON i.telegram_user_id = u.telegram_user_id
                         AND i.usage_date = ?
-                    ORDER BY image_count DESC, u.telegram_user_id
+                    LEFT JOIN (
+                        SELECT telegram_user_id, SUM(cost_microusd) AS cost_microusd
+                        FROM api_cost_usage
+                        WHERE usage_date = ?
+                        GROUP BY telegram_user_id
+                    ) AS c ON c.telegram_user_id = u.telegram_user_id
+                    ORDER BY cost_microusd DESC, image_count DESC, u.telegram_user_id
                     """,
-                    (usage_date,),
+                    (usage_date, usage_date),
                 ).fetchall()
                 return [
                     UserDailyUsage(
@@ -195,6 +279,7 @@ class Database:
                         username=row["username"],
                         first_name=row["first_name"],
                         image_count=int(row["image_count"]),
+                        cost_microusd=int(row["cost_microusd"]),
                     )
                     for row in rows
                 ]
