@@ -45,3 +45,28 @@ async def test_usage_is_separate_for_each_date(tmp_path) -> None:
 
     assert await database.get_image_usage(303, "2026-10-01") == 1
     assert await database.get_image_usage(303, "2026-10-02") == 0
+
+
+@pytest.mark.asyncio
+async def test_budget_usage_counts_user_day_and_global_rolling_week(tmp_path) -> None:
+    database = Database(tmp_path / "test.sqlite3")
+    await database.initialize()
+    await database.upsert_user(101, "one", "Первый")
+    await database.upsert_user(202, "two", "Второй")
+
+    await database.record_cost(101, "2026-10-01", "2026-10-01T10:00:00+00:00", 120_000, "text")
+    await database.record_cost(202, "2026-10-01", "2026-10-01T11:00:00+00:00", 80_000, "image")
+    await database.record_cost(101, "2026-09-20", "2026-09-20T10:00:00+00:00", 900_000, "text")
+
+    usage = await database.get_budget_usage(
+        101, "2026-10-01", "2026-09-24T12:00:00+00:00"
+    )
+
+    assert usage.user_daily_microusd == 120_000
+    assert usage.global_weekly_microusd == 200_000
+
+    rows = await database.daily_usage("2026-10-01")
+    assert [(row.user_id, row.cost_microusd) for row in rows] == [
+        (101, 120_000),
+        (202, 80_000),
+    ]
